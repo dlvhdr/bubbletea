@@ -1,8 +1,6 @@
 package tea
 
 import (
-	"runtime"
-
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -36,28 +34,33 @@ type KeyboardEnhancements struct {
 	//  [ansi.KittyDisambiguateEscapeCodes] but uses XTerm escape codes.
 	//  - Mode 2 reports all key as escape codes including printable keys like "a" and "shift+b".
 	modifyOtherKeys int
+
+	// keyReleases indicates whether we have key release events enabled. This is mainly
+	// used in Windows to ignore key releases when they are not requested.
+	keyReleases bool
 }
 
 // KeyboardEnhancementOption is a type that represents a keyboard enhancement.
 type KeyboardEnhancementOption func(k *KeyboardEnhancements)
 
-// WithKeyReleases enables support for reporting release key events. This is
+// withKeyReleases enables support for reporting release key events. This is
 // useful for terminals that support the Kitty keyboard protocol "Report event
 // types" progressive enhancement feature.
 //
 // Note that not all terminals support this feature.
-func WithKeyReleases(k *KeyboardEnhancements) {
+func withKeyReleases(k *KeyboardEnhancements) {
 	k.kittyFlags |= ansi.KittyReportEventTypes
+	k.keyReleases = true
 }
 
-// WithUniformKeyLayout enables support for reporting key events as though they
+// withUniformKeyLayout enables support for reporting key events as though they
 // were on a PC-101 layout. This is useful for uniform key event reporting
 // across different keyboard layouts. This is equivalent to the Kitty keyboard
 // protocol "Report alternate keys" and "Report all keys as escape codes"
 // progressive enhancement features.
 //
 // Note that not all terminals support this feature.
-func WithUniformKeyLayout(k *KeyboardEnhancements) {
+func withUniformKeyLayout(k *KeyboardEnhancements) {
 	k.kittyFlags |= ansi.KittyReportAlternateKeys | ansi.KittyReportAllKeysAsEscapeCodes
 }
 
@@ -74,25 +77,41 @@ func withKeyDisambiguation(k *KeyboardEnhancements) {
 
 type enableKeyboardEnhancementsMsg []KeyboardEnhancementOption
 
-// RequestKeyboardEnhancements is a command that enables keyboard enhancements
-// in the terminal.
+// RequestKeyDisambiguation is a command that enables support for reporting
+// disambiguous keys as escape codes. This is enabled by default in Bubble Tea
+// and there's no need to call this function unless you disabled keyboard
+// enhancements through [DisableKeyboardEnhancements].
 //
-// This command can be used to request specific keyboard enhancements. Use this
-// command to request enabling support for key disambiguation. You can also
-// request other enhancements by passing additional options. For example:
+// If the terminal supports the requested enhancements, it will send a
+// [KeyboardEnhancementsMsg] message with the supported enhancements.
 //
-//   - [WithKeyReleases] enables support for reporting release key events.
-//   - [WithUniformKeyLayout] enables support for reporting key events as though
-//     they were on a PC-101 layout.
+// Note that not all terminals support this feature. If the terminal does not
+// support this feature, the program will not receive disambiguated key
+// events.
+func RequestKeyDisambiguation() Msg {
+	return enableKeyboardEnhancementsMsg{withKeyDisambiguation}
+}
+
+// RequestKeyReleases is a command that enables support for reporting key
+// release events.
 //
 // If the terminal supports the requested enhancements, it will send a
 // [KeyboardEnhancementsMsg] message with the supported enhancements.
 //
 // Note that not all terminals support all enhancements.
-func RequestKeyboardEnhancements(enhancements ...KeyboardEnhancementOption) Cmd {
-	return func() Msg {
-		return enableKeyboardEnhancementsMsg(append(enhancements, withKeyDisambiguation))
-	}
+func RequestKeyReleases() Msg {
+	return enableKeyboardEnhancementsMsg{withKeyReleases}
+}
+
+// RequestUniformKeyLayout is a command that enables support for reporting key
+// events as though they were on a PC-101 layout.
+//
+// If the terminal supports the requested enhancements, it will send a
+// [KeyboardEnhancementsMsg] message with the supported enhancements.
+//
+// Note that not all terminals support all enhancements.
+func RequestUniformKeyLayout() Msg {
+	return enableKeyboardEnhancementsMsg{withUniformKeyLayout}
 }
 
 type disableKeyboardEnhancementsMsg struct{}
@@ -110,7 +129,7 @@ type KeyboardEnhancementsMsg KeyboardEnhancements
 // SupportsKeyDisambiguation returns whether the terminal supports reporting
 // disambiguous keys as escape codes.
 func (k KeyboardEnhancementsMsg) SupportsKeyDisambiguation() bool {
-	if runtime.GOOS == "windows" { //nolint:goconst
+	if isWindows() {
 		// We use Windows Console API which supports reporting disambiguous keys.
 		return true
 	}
@@ -120,9 +139,9 @@ func (k KeyboardEnhancementsMsg) SupportsKeyDisambiguation() bool {
 // SupportsKeyReleases returns whether the terminal supports key release
 // events.
 func (k KeyboardEnhancementsMsg) SupportsKeyReleases() bool {
-	if runtime.GOOS == "windows" {
+	if isWindows() {
 		// We use Windows Console API which supports key release events.
-		return true
+		return k.keyReleases
 	}
 	return k.kittyFlags&ansi.KittyReportEventTypes != 0
 }
@@ -130,7 +149,7 @@ func (k KeyboardEnhancementsMsg) SupportsKeyReleases() bool {
 // SupportsUniformKeyLayout returns whether the terminal supports reporting key
 // events as though they were on a PC-101 layout.
 func (k KeyboardEnhancementsMsg) SupportsUniformKeyLayout() bool {
-	if runtime.GOOS == "windows" {
+	if isWindows() {
 		// We use Windows Console API which supports reporting key events as
 		// though they were on a PC-101 layout.
 		return true

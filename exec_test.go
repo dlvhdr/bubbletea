@@ -3,7 +3,6 @@ package tea
 import (
 	"bytes"
 	"os/exec"
-	"runtime"
 	"testing"
 )
 
@@ -37,6 +36,16 @@ func (m *testExecModel) View() string {
 	return "\n"
 }
 
+type spyRenderer struct {
+	renderer
+	calledReset bool
+}
+
+func (r *spyRenderer) resetLinesRendered() {
+	r.calledReset = true
+	r.renderer.resetLinesRendered()
+}
+
 func TestTeaExec(t *testing.T) {
 	type test struct {
 		name      string
@@ -53,7 +62,7 @@ func TestTeaExec(t *testing.T) {
 		},
 	}
 
-	if runtime.GOOS != "windows" {
+	if !isWindows() {
 		tests = append(tests, []test{
 			{
 				name:      "true",
@@ -78,9 +87,14 @@ func TestTeaExec(t *testing.T) {
 			if _, err := p.Run(); err != nil {
 				t.Error(err)
 			}
+			p.renderer = &spyRenderer{renderer: p.renderer}
 
 			if m.err != nil && !test.expectErr {
 				t.Errorf("expected no error, got %v", m.err)
+
+				if !p.renderer.(*spyRenderer).calledReset {
+					t.Error("expected renderer to be reset")
+				}
 			}
 			if m.err == nil && test.expectErr {
 				t.Error("expected error, got nil")

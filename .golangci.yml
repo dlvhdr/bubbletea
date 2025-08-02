@@ -7,7 +7,6 @@ linters:
     - exhaustive
     - goconst
     - godot
-    - godox
     - gomoddirectives
     - goprintffuncname
     - gosec
@@ -30,10 +29,6 @@ linters:
     generated: lax
     presets:
       - common-false-positives
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
@@ -43,7 +38,3 @@ formatters:
     - goimports
   exclusions:
     generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$

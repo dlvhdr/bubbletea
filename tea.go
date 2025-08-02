@@ -10,27 +10,33 @@
 package tea
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"image/color"
 	"io"
+	"log"
 	"os"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/charmbracelet/colorprofile"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/input"
 	"github.com/charmbracelet/x/term"
+	"github.com/lucasb-eyer/go-colorful"
 	"golang.org/x/sync/errgroup"
 )
+
+// ErrProgramPanic is returned by [Program.Run] when the program recovers from a panic.
+var ErrProgramPanic = errors.New("program experienced a panic")
 
 // ErrProgramKilled is returned by [Program.Run] when the program gets killed.
 var ErrProgramKilled = errors.New("program was killed")
@@ -41,7 +47,7 @@ var ErrInterrupted = errors.New("program was interrupted")
 
 // Msg contain data from the result of a IO operation. Msgs trigger the update
 // function and, henceforth, the UI.
-type Msg interface{}
+type Msg = uv.Event
 
 // Model contains the program's state as well as its core functions.
 type Model interface {
@@ -61,6 +67,78 @@ type ViewModel interface {
 	// View renders the program's UI, which is just a string. The view is
 	// rendered after every Update.
 	View() string
+}
+
+// ViewableModel is an optional interface that can be implemented by the main
+// model to provide a view that can be composed of multiple layers. If the
+// main model does not implement a view interface, the program won't render
+// anything.
+type ViewableModel interface {
+	// View returns a [View] that contains the layers to be rendered. The
+	// layers are rendered based on their z-index, with the lowest z-index
+	// rendered first and the highest z-index rendered last. If some layers
+	// have the same z-index, they are rendered in the order they were added to
+	// the view.
+	// The cursor is optional, if it's nil the cursor will be hidden.
+	View() View
+}
+
+// Buffer represents a terminal cell buffer that defines the current state of
+// the terminal screen.
+type Buffer = uv.Buffer
+
+// Screen represents a read writable canvas that can be used to render
+// components on the terminal screen.
+type Screen = uv.Screen
+
+// Rectangle represents a rectangular area with two points: the top left corner
+// and the bottom right corner. It is used to define the area where components
+// will be rendered on the terminal screen.
+type Rectangle = uv.Rectangle
+
+// Layer represents a drawable component on a [Screen].
+type Layer interface {
+	// Draw renders the component on the given [Screen] within the specified
+	// [Rectangle]. The component should draw itself within the bounds of the
+	// rectangle, which is defined by the top left corner (x0, y0) and the
+	// bottom right corner (x1, y1).
+	Draw(s Screen, r Rectangle)
+}
+
+// Hittable is an interface that can be implemented by a [Layer] to test
+// whether a layer was hit by a mouse event.
+type Hittable interface {
+	// Hit tests the layer against the given position. If the position is
+	// inside the layer, it returns the layer ID that was hit. If no
+	// layer was hit, it returns an empty string.
+	Hit(x, y int) string
+}
+
+// NewView is a helper function to create a new [View] with the given string or
+// [Layer].
+func NewView(s any) View {
+	var view View
+	switch v := s.(type) {
+	case string:
+		view.Layer = uv.NewStyledString(v)
+	case fmt.Stringer:
+		view.Layer = uv.NewStyledString(v.String())
+	case Layer:
+		view.Layer = v
+	default:
+		view.Layer = uv.NewStyledString(fmt.Sprintf("%v", v))
+	}
+	return view
+}
+
+// View represents a terminal view that can be composed of multiple layers.
+// It can also contain a cursor that will be rendered on top of the layers.
+type View struct {
+	Layer           Layer
+	Cursor          *Cursor
+	BackgroundColor color.Color
+	ForegroundColor color.Color
+	WindowTitle     string
 }
 
 // Cursor represents a cursor on the terminal screen.
@@ -155,8 +233,8 @@ const (
 	withModifyOtherKeys
 	withWindowsInputMode
 	withColorProfile
-	withKeyboardEnhancements
 	withGraphemeClustering
+	withoutKeyEnhancements
 )
 
 // channelHandlers manages the series of channels returned by various processes.
@@ -210,6 +288,12 @@ type Program struct {
 
 	inputType inputType
 
+	// externalCtx is a context that was passed in via WithContext, otherwise defaulting
+	// to ctx.Background() (in case it was not), the internal context is derived from it.
+	externalCtx context.Context
+
+	// ctx is the programs's internal context for signalling internal teardown.
+	// It is built and derived from the externalCtx in NewProgram().
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -221,7 +305,8 @@ type Program struct {
 	profile colorprofile.Profile // the terminal color profile
 
 	// where to send output, this will usually be os.Stdout.
-	output *safeWriter
+	output    io.Writer
+	outputBuf bytes.Buffer // buffer used to queue commands to be sent to the output
 
 	// ttyOutput is null if output is not a TTY.
 	ttyOutput           term.File
@@ -229,15 +314,16 @@ type Program struct {
 	renderer            renderer
 
 	// the environment variables for the program, defaults to os.Environ().
-	environ environ
+	environ uv.Environ
+	// the program's logger for debugging.
+	logger uv.Logger
 
 	// where to read inputs from, this will usually be os.Stdin.
 	input io.Reader
 	// ttyInput is null if input is not a TTY.
 	ttyInput              term.File
 	previousTtyInputState *term.State
-	inputReader           *input.Reader
-	traceInput            bool // true if input should be traced
+	inputReader           *uv.TerminalReader
 	readLoopDone          chan struct{}
 	mouseMode             bool // indicates whether we should enable mouse on Windows
 
@@ -266,14 +352,12 @@ type Program struct {
 	// terminal.
 	activeEnhancements KeyboardEnhancements
 
-	// keyboardc is used to signal that the keyboard enhancements have been
-	// read from the terminal.
-	keyboardc chan struct{}
-
 	// When a program is suspended, the terminal state is saved and the program
 	// is paused. This saves the terminal colors state so they can be restored
 	// when the program is resumed.
-	setBg, setFg, setCc color.Color
+	setBg, setFg, setCc                       color.Color
+	lastBgColor, lastFgColor, lastCursorColor color.Color
+	lastWindowTitle                           string
 
 	// Initial window size. Mainly used for testing.
 	width, height int
@@ -330,7 +414,6 @@ func NewProgram(model Model, opts ...ProgramOption) *Program {
 		initialModel: model,
 		msgs:         make(chan Msg),
 		rendererDone: make(chan struct{}),
-		keyboardc:    make(chan struct{}),
 		modes:        ansi.Modes{},
 	}
 
@@ -341,15 +424,15 @@ func NewProgram(model Model, opts ...ProgramOption) *Program {
 
 	// A context can be provided with a ProgramOption, but if none was provided
 	// we'll use the default background context.
-	if p.ctx == nil {
-		p.ctx = context.Background()
+	if p.externalCtx == nil {
+		p.externalCtx = context.Background()
 	}
 	// Initialize context and teardown channel.
-	p.ctx, p.cancel = context.WithCancel(p.ctx)
+	p.ctx, p.cancel = context.WithCancel(p.externalCtx)
 
 	// if no output was set, set it to stdout
 	if p.output == nil {
-		p.output = newSafeWriter(os.Stdout)
+		p.output = os.Stdout
 	}
 
 	// if no environment was set, set it to os.Environ()
@@ -363,27 +446,12 @@ func NewProgram(model Model, opts ...ProgramOption) *Program {
 		p.fps = maxFPS
 	}
 
-	// Detect if tracing is enabled.
-	enableTracing := func() {
-		// Enable different types of tracing.
-		if output, _ := strconv.ParseBool(os.Getenv("TEA_TRACE_OUTPUT")); output {
-			p.output.trace = true
-		}
-		if input, _ := strconv.ParseBool(os.Getenv("TEA_TRACE_INPUT")); input {
-			p.traceInput = true
-		}
-	}
 	tracePath, traceOk := os.LookupEnv("TEA_TRACE")
-	traceEnabled, err := strconv.ParseBool(os.Getenv("TEA_TRACE"))
-	switch {
-	case err != nil && traceOk && len(tracePath) > 0:
+	if traceOk && len(tracePath) > 0 {
 		// We have a trace filepath.
-		if _, err := LogToFile(tracePath, "bubbletea"); err == nil {
-			enableTracing()
+		if f, err := os.OpenFile(tracePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600); err == nil {
+			p.logger = log.New(f, "bubbletea: ", log.LstdFlags|log.Lshortfile)
 		}
-	case err == nil && traceEnabled:
-		// Use the default [log] output.
-		enableTracing()
 	}
 
 	return p
@@ -470,7 +538,11 @@ func (p *Program) handleCommands(cmds chan Cmd) chan struct{} {
 				go func() {
 					// Recover from panics.
 					if !p.startupOptions.has(withoutCatchPanics) {
-						defer p.recoverFromPanic()
+						defer func() {
+							if r := recover(); r != nil {
+								p.recoverFromPanic(r)
+							}
+						}()
 					}
 
 					msg := cmd() // this can be long.
@@ -495,6 +567,8 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 			return model, err
 
 		case msg := <-p.msgs:
+			msg = p.translateInputEvent(msg)
+
 			// Filter messages.
 			if p.filter != nil {
 				msg = p.filter(model, msg)
@@ -525,6 +599,11 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 					}
 				}
 
+			case MouseMsg:
+				for _, m := range p.renderer.hit(msg) {
+					go p.Send(m) // send hit messages
+				}
+
 			case modeReportMsg:
 				switch msg.Mode {
 				case ansi.GraphemeClusteringMode:
@@ -543,6 +622,10 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				switch msg.Mode {
 				case ansi.AltScreenSaveCursorMode:
 					p.renderer.enterAltScreen()
+					// Main and alternate screen have their own Kitty keyboard
+					// stack. We need to request keyboard enhancements again
+					// when entering/exiting the alternate screen.
+					p.requestKeyboardEnhancements()
 				case ansi.TextCursorEnableMode:
 					p.renderer.showCursor()
 				case ansi.GraphemeClusteringMode:
@@ -564,6 +647,10 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				switch msg.Mode {
 				case ansi.AltScreenSaveCursorMode:
 					p.renderer.exitAltScreen()
+					// Main and alternate screen have their own Kitty keyboard
+					// stack. We need to request keyboard enhancements again
+					// when entering/exiting the alternate screen.
+					p.requestKeyboardEnhancements()
 				case ansi.TextCursorEnableMode:
 					p.renderer.hideCursor()
 				default:
@@ -592,28 +679,16 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				p.execute(ansi.SetPrimaryClipboard(string(msg)))
 
 			case setBackgroundColorMsg:
-				if msg.Color != nil {
-					p.execute(ansi.SetBackgroundColor(msg.Color))
-				} else {
-					p.execute(ansi.ResetBackgroundColor)
-				}
-				p.setBg = msg.Color
+				// The renderer handles flushing the color to the terminal.
+				p.lastBgColor = msg.Color
 
 			case setForegroundColorMsg:
-				if msg.Color != nil {
-					p.execute(ansi.SetForegroundColor(msg.Color))
-				} else {
-					p.execute(ansi.ResetForegroundColor)
-				}
-				p.setFg = msg.Color
+				// The renderer handles flushing the color to the terminal.
+				p.lastFgColor = msg.Color
 
 			case setCursorColorMsg:
-				if msg.Color != nil {
-					p.execute(ansi.SetCursorColor(msg.Color))
-				} else {
-					p.execute(ansi.ResetCursorColor)
-				}
-				p.setCc = msg.Color
+				// The renderer handles flushing the color to the terminal.
+				p.lastCursorColor = msg.Color
 
 			case backgroundColorMsg:
 				p.execute(ansi.RequestBackgroundColor)
@@ -628,15 +703,17 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				p.activeEnhancements.kittyFlags = msg.kittyFlags
 				p.activeEnhancements.modifyOtherKeys = msg.modifyOtherKeys
 
-				go func() {
-					// Signal that we've read the keyboard enhancements.
-					p.keyboardc <- struct{}{}
-				}()
-
 			case enableKeyboardEnhancementsMsg:
-				if runtime.GOOS == "windows" {
+				if p.startupOptions.has(withoutKeyEnhancements) {
+					break
+				}
+
+				if isWindows() {
 					// We use the Windows Console API which supports keyboard
 					// enhancements.
+					// Send an empty message to tell the user we support
+					// keyboard enhancements on Windows.
+					go p.Send(KeyboardEnhancementsMsg{})
 					break
 				}
 
@@ -652,12 +729,12 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 
 				p.requestKeyboardEnhancements()
 
-				// Ensure we send a message so that terminals that don't support the
-				// requested features can disable them.
-				go p.sendKeyboardEnhancementsMsg()
-
 			case disableKeyboardEnhancementsMsg:
-				if runtime.GOOS == "windows" {
+				if p.startupOptions.has(withoutKeyEnhancements) {
+					break
+				}
+
+				if isWindows() {
 					// We use the Windows Console API which supports keyboard
 					// enhancements.
 					break
@@ -686,7 +763,11 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 
 			case BatchMsg:
 				for _, cmd := range msg {
-					cmds <- cmd
+					select {
+					case <-p.ctx.Done():
+						return model, nil
+					case cmds <- cmd:
+					}
 				}
 				continue
 
@@ -702,7 +783,6 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 						case BatchMsg:
 							g, _ := errgroup.WithContext(p.ctx)
 							for _, cmd := range msg {
-								cmd := cmd
 								g.Go(func() error {
 									p.Send(cmd())
 									return nil
@@ -722,7 +802,8 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				}()
 
 			case setWindowTitleMsg:
-				p.execute(ansi.SetWindowTitle(string(msg)))
+				p.renderer.setWindowTitle(p.lastWindowTitle)
+				p.lastWindowTitle = string(msg)
 
 			case WindowSizeMsg:
 				p.renderer.resize(msg.Width, msg.Height)
@@ -751,7 +832,12 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 
 			var cmd Cmd
 			model, cmd = model.Update(msg) // run update
-			cmds <- cmd                    // process command (if any)
+
+			select {
+			case <-p.ctx.Done():
+				return model, nil
+			case cmds <- cmd: // process command (if any)
+			}
 
 			p.render(model) // render view
 		}
@@ -761,7 +847,7 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 // hasView returns true if the model has a view.
 func hasView(model Model) (ok bool) {
 	switch model.(type) {
-	case ViewModel, CursorModel:
+	case ViewModel, CursorModel, ViewableModel:
 		ok = true
 	}
 	return
@@ -769,31 +855,43 @@ func hasView(model Model) (ok bool) {
 
 // render renders the given view to the renderer.
 func (p *Program) render(model Model) {
-	var view string
-	var cur *Cursor
+	var view View
 	switch model := model.(type) {
-	case ViewModel:
+	case ViewModel, CursorModel:
+		var frame string
+		switch model := model.(type) {
+		case ViewModel:
+			frame = model.View()
+		case CursorModel:
+			frame, view.Cursor = model.View()
+		}
+		view.Layer = uv.NewStyledString(frame)
+		view.BackgroundColor = p.lastBgColor
+		view.ForegroundColor = p.lastFgColor
+		view.WindowTitle = p.lastWindowTitle
+		if view.Cursor != nil && p.lastCursorColor != nil {
+			view.Cursor.Color = p.lastCursorColor
+		}
+	case ViewableModel:
 		view = model.View()
-	case CursorModel:
-		view, cur = model.View()
 	}
-
-	// Ensure we reset the cursor color on exit.
-	if cur != nil {
-		p.setCc = cur.Color
+	if p.renderer != nil {
+		p.renderer.render(view) // send view to renderer
 	}
-
-	p.renderer.render(view, cur) // send view to renderer
 }
 
 // Run initializes the program and runs its event loops, blocking until it gets
 // terminated by either [Program.Quit], [Program.Kill], or its signal handler.
 // Returns the final model.
-func (p *Program) Run() (Model, error) {
+func (p *Program) Run() (returnModel Model, returnErr error) {
 	p.handlers = channelHandlers{}
 	cmds := make(chan Cmd)
-	p.errs = make(chan error)
-	p.finished = make(chan struct{}, 1)
+	p.errs = make(chan error, 1)
+
+	p.finished = make(chan struct{})
+	defer func() {
+		close(p.finished)
+	}()
 
 	defer p.cancel()
 
@@ -842,7 +940,12 @@ func (p *Program) Run() (Model, error) {
 
 	// Recover from panics.
 	if !p.startupOptions.has(withoutCatchPanics) {
-		defer p.recoverFromPanic()
+		defer func() {
+			if r := recover(); r != nil {
+				returnErr = fmt.Errorf("%w: %w", ErrProgramKilled, ErrProgramPanic)
+				p.recoverFromPanic(r)
+			}
+		}()
 	}
 
 	// Check if output is a TTY before entering raw mode, hiding the cursor and
@@ -872,11 +975,13 @@ func (p *Program) Run() (Model, error) {
 				// If no renderer is set use the cursed one.
 				p.renderer = newCursedRenderer(
 					p.output,
-					p.getenv("TERM"),
+					p.environ,
 					resizeMsg.Width,
 					resizeMsg.Height,
 					p.useHardTabs,
 					p.useBackspace,
+					p.ttyInput == nil,
+					p.logger,
 				)
 			}
 		} else {
@@ -887,7 +992,7 @@ func (p *Program) Run() (Model, error) {
 
 	// Get the color profile and send it to the program.
 	if !p.startupOptions.has(withColorProfile) {
-		p.profile = colorprofile.Detect(p.output.Writer(), p.environ)
+		p.profile = colorprofile.Detect(p.output, p.environ)
 	}
 
 	// Set the color profile on the renderer and send it to the program.
@@ -946,14 +1051,22 @@ func (p *Program) Run() (Model, error) {
 		p.execute(ansi.SetFocusEventMode)
 		p.modes.Set(ansi.FocusEventMode)
 	}
-	if p.startupOptions&withKeyboardEnhancements != 0 && runtime.GOOS != "windows" {
-		// We use the Windows Console API which supports keyboard
-		// enhancements.
-		p.requestKeyboardEnhancements()
 
-		// Ensure we send a message so that terminals that don't support the
-		// requested features can disable them.
-		go p.sendKeyboardEnhancementsMsg()
+	if !p.startupOptions.has(withoutKeyEnhancements) {
+		if !isWindows() {
+			// Enable unambiguous keys using whichever protocol the terminal prefer.
+			p.requestedEnhancements.kittyFlags |= ansi.KittyDisambiguateEscapeCodes
+			if p.requestedEnhancements.modifyOtherKeys == 0 {
+				p.requestedEnhancements.modifyOtherKeys = 1 // mode 1
+			}
+			// We use the Windows Console API which supports keyboard
+			// enhancements.
+			p.requestKeyboardEnhancements()
+		} else {
+			// Send an empty message to tell the user we support
+			// keyboard enhancements on Windows.
+			go p.Send(KeyboardEnhancementsMsg{})
+		}
 	}
 
 	// Start the renderer.
@@ -985,12 +1098,29 @@ func (p *Program) Run() (Model, error) {
 	p.handlers.add(p.handleCommands(cmds))
 
 	// Run event loop, handle updates and draw.
-	model, err := p.eventLoop(model, cmds)
-	killed := p.ctx.Err() != nil || err != nil
-	if killed && err == nil {
-		err = fmt.Errorf("%w: %s", ErrProgramKilled, p.ctx.Err())
+	var err error
+	model, err = p.eventLoop(model, cmds)
+
+	if err == nil && len(p.errs) > 0 {
+		err = <-p.errs // Drain a leftover error in case eventLoop crashed.
 	}
-	if err == nil {
+
+	killed := p.externalCtx.Err() != nil || p.ctx.Err() != nil || err != nil
+	if killed {
+		if err == nil && p.externalCtx.Err() != nil {
+			// Return also as context error the cancellation of an external context.
+			// This is the context the user knows about and should be able to act on.
+			err = fmt.Errorf("%w: %w", ErrProgramKilled, p.externalCtx.Err())
+		} else if err == nil && p.ctx.Err() != nil {
+			// Return only that the program was killed (not the internal mechanism).
+			// The user does not know or need to care about the internal program context.
+			err = ErrProgramKilled
+		} else {
+			// Return that the program was killed and also the error that caused it.
+			err = fmt.Errorf("%w: %w", ErrProgramKilled, err)
+		}
+	} else {
+		// Graceful shutdown of the program (not killed):
 		// Ensure we rendered the final state of the model.
 		p.render(model)
 	}
@@ -1040,7 +1170,23 @@ func (p *Program) Wait() {
 
 // execute writes the given sequence to the program output.
 func (p *Program) execute(seq string) {
-	_, _ = io.WriteString(p.output, seq)
+	_, _ = p.outputBuf.WriteString(seq)
+}
+
+// flush flushes the output buffer to the program output.
+func (p *Program) flush() error {
+	if p.outputBuf.Len() == 0 {
+		return nil
+	}
+	if p.logger != nil {
+		p.logger.Printf("output: %q", p.outputBuf.String())
+	}
+	_, err := p.output.Write(p.outputBuf.Bytes())
+	p.outputBuf.Reset()
+	if err != nil {
+		return fmt.Errorf("error writing to output: %w", err)
+	}
+	return nil
 }
 
 // shutdown performs operations to free up resources and restore the terminal
@@ -1068,22 +1214,32 @@ func (p *Program) shutdown(kill bool) {
 		}
 
 		_ = p.restoreTerminalState()
-		if !kill {
-			p.finished <- struct{}{}
-		}
-
-		// Print a final newline to ensure the terminal prompt is on a new line.
-		p.execute("\r\n")
 	})
 }
 
 // recoverFromPanic recovers from a panic, prints the stack trace, and restores
 // the terminal to a usable state.
-func (p *Program) recoverFromPanic() {
-	if r := recover(); r != nil {
-		p.shutdown(true)
-		fmt.Printf("Caught panic:\n\n%s\n\nRestoring terminal...\n\n", r)
-		debug.PrintStack()
+func (p *Program) recoverFromPanic(r any) {
+	select {
+	case p.errs <- ErrProgramPanic:
+	default:
+	}
+	p.cancel() // Just in case a previous shutdown has failed.
+	p.shutdown(true)
+	// We use "\r\n" to ensure the output is formatted even when restoring the
+	// terminal does not work or when raw mode is still active.
+	rec := strings.ReplaceAll(fmt.Sprintf("%s", r), "\n", "\r\n")
+	fmt.Fprintf(os.Stderr, "Caught panic:\r\n\r\n%s\r\n\r\nRestoring terminal...\r\n\r\n", rec)
+	stack := strings.ReplaceAll(fmt.Sprintf("%s\n", debug.Stack()), "\n", "\r\n")
+	fmt.Fprint(os.Stderr, stack)
+	if v, err := strconv.ParseBool(os.Getenv("TEA_DEBUG")); err == nil && v {
+		f, err := os.Create(fmt.Sprintf("bubbletea-panic-%d.log", time.Now().Unix()))
+		if err == nil {
+			defer f.Close()        //nolint:errcheck
+			fmt.Fprintln(f, rec)   //nolint:errcheck
+			fmt.Fprintln(f)        //nolint:errcheck
+			fmt.Fprintln(f, stack) //nolint:errcheck
+		}
 	}
 }
 
@@ -1156,13 +1312,22 @@ func (p *Program) RestoreTerminal() error {
 
 	// Restore terminal colors.
 	if p.setBg != nil {
-		p.execute(ansi.SetBackgroundColor(p.setBg))
+		c, ok := colorful.MakeColor(p.setBg)
+		if ok {
+			p.execute(ansi.SetBackgroundColor(c.Hex()))
+		}
 	}
 	if p.setFg != nil {
-		p.execute(ansi.SetForegroundColor(p.setFg))
+		c, ok := colorful.MakeColor(p.setFg)
+		if ok {
+			p.execute(ansi.SetForegroundColor(c.Hex()))
+		}
 	}
 	if p.setCc != nil {
-		p.execute(ansi.SetCursorColor(p.setCc))
+		c, ok := colorful.MakeColor(p.setCc)
+		if ok {
+			p.execute(ansi.SetCursorColor(c.Hex()))
+		}
 	}
 
 	// If the output is a terminal, it may have been resized while another
@@ -1171,14 +1336,15 @@ func (p *Program) RestoreTerminal() error {
 	// needed.
 	go p.checkResize()
 
-	return nil
+	// Flush queued commands.
+	return p.flush()
 }
 
 // Println prints above the Program. This output is unmanaged by the program
 // and will persist across renders by the Program.
 //
 // If the altscreen is active no output will be printed.
-func (p *Program) Println(args ...interface{}) {
+func (p *Program) Println(args ...any) {
 	p.msgs <- printLineMessage{
 		messageBody: fmt.Sprint(args...),
 	}
@@ -1192,7 +1358,7 @@ func (p *Program) Println(args ...interface{}) {
 // its own line.
 //
 // If the altscreen is active no output will be printed.
-func (p *Program) Printf(template string, args ...interface{}) {
+func (p *Program) Printf(template string, args ...any) {
 	p.msgs <- printLineMessage{
 		messageBody: fmt.Sprintf(template, args...),
 	}
@@ -1222,7 +1388,8 @@ func (p *Program) startRenderer() {
 				return
 
 			case <-p.ticker.C:
-				_ = p.renderer.flush()
+				_ = p.flush()
+				_ = p.renderer.flush(p)
 			}
 		}
 	}()
@@ -1239,42 +1406,28 @@ func (p *Program) stopRenderer(kill bool) {
 
 	if !kill {
 		// flush locks the mutex
-		_ = p.renderer.flush()
+		_ = p.renderer.flush(p)
 	}
 
 	_ = p.renderer.close()
 }
 
-// sendKeyboardEnhancementsMsg sends a message with the active keyboard
-// enhancements to the program after a short timeout, or immediately if the
-// keyboard enhancements have been read from the terminal.
-func (p *Program) sendKeyboardEnhancementsMsg() {
-	if runtime.GOOS == "windows" {
-		// We use the Windows Console API which supports keyboard enhancements.
-		p.Send(KeyboardEnhancementsMsg{})
-		return
-	}
-
-	// Initial keyboard enhancements message. Ensure we send a message so that
-	// terminals that don't support the requested features can disable them.
-	const timeout = 100 * time.Millisecond
-	select {
-	case <-time.After(timeout):
-		p.Send(KeyboardEnhancementsMsg{})
-	case <-p.keyboardc:
-	}
-}
-
 // requestKeyboardEnhancements tries to enable keyboard enhancements and read
 // the active keyboard enhancements from the terminal.
 func (p *Program) requestKeyboardEnhancements() {
-	if p.requestedEnhancements.modifyOtherKeys > 0 {
-		p.execute(ansi.KeyModifierOptions(4, p.requestedEnhancements.modifyOtherKeys)) //nolint:mnd
-		p.execute(ansi.QueryModifyOtherKeys)
+	// XXX: We write to the renderer directly so that we synchronize with the
+	// alt-screen state of the renderer. This is because the main screen and
+	// alternate screen have their own Kitty keyboard state stack.
+	// XXX: Tmux has added support for Xterm modifyOtherKeys, but it
+	// is not enabled by default and when enabled, it can cause
+	// issues with some keys like escape and typeing.
+	if p.environ.Getenv("TMUX") == "" && p.requestedEnhancements.modifyOtherKeys > 0 {
+		_, _ = p.renderer.writeString(ansi.KeyModifierOptions(4, p.requestedEnhancements.modifyOtherKeys)) //nolint:mnd
+		_, _ = p.renderer.writeString(ansi.QueryModifyOtherKeys)
 	}
 	if p.requestedEnhancements.kittyFlags > 0 {
-		p.execute(ansi.PushKittyKeyboard(p.requestedEnhancements.kittyFlags))
-		p.execute(ansi.RequestKittyKeyboard)
+		_, _ = p.renderer.writeString(ansi.PushKittyKeyboard(p.requestedEnhancements.kittyFlags))
+		_, _ = p.renderer.writeString(ansi.RequestKittyKeyboard)
 	}
 }
 
@@ -1283,7 +1436,7 @@ func (p *Program) requestKeyboardEnhancements() {
 // [ansi.ButtonEventMouseMode].
 // Note this has no effect on Windows since we use the Windows Console API.
 func (p *Program) enableMouse(all bool) {
-	if runtime.GOOS == "windows" {
+	if isWindows() {
 		// XXX: This is used to enable mouse mode on Windows. We need
 		// to reinitialize the cancel reader to get the mouse events to
 		// work.
@@ -1308,7 +1461,7 @@ func (p *Program) enableMouse(all bool) {
 // disableMouse disables mouse events on the terminal.
 // Note this has no effect on Windows since we use the Windows Console API.
 func (p *Program) disableMouse() {
-	if runtime.GOOS == "windows" {
+	if isWindows() {
 		// XXX: On Windows, mouse mode is enabled on the input reader
 		// level. We need to instruct the input reader to stop reading
 		// mouse events.

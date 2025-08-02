@@ -2,6 +2,7 @@ package tea
 
 import (
 	"fmt"
+	"image/color"
 
 	"github.com/charmbracelet/colorprofile"
 )
@@ -19,10 +20,13 @@ type renderer interface {
 	close() error
 
 	// render renders a frame to the output.
-	render(string, *Cursor)
+	render(View)
+
+	// hit returns possible hit messages for the renderer.
+	hit(MouseMsg) []Msg
 
 	// flush flushes the renderer's buffer to the output.
-	flush() error
+	flush(*Program) error
 
 	// reset resets the renderer's state to its initial state.
 	reset()
@@ -42,6 +46,18 @@ type renderer interface {
 	// hideCursor hides the cursor.
 	hideCursor()
 
+	// setCursorColor sets the terminal's cursor color.
+	setCursorColor(color.Color)
+
+	// setForegroundColor sets the terminal's foreground color.
+	setForegroundColor(color.Color)
+
+	// setBackgroundColor sets the terminal's background color.
+	setBackgroundColor(color.Color)
+
+	// setWindowTitle sets the terminal window title.
+	setWindowTitle(string)
+
 	// resize notify the renderer of a terminal resize.
 	resize(int, int)
 
@@ -53,6 +69,11 @@ type renderer interface {
 
 	// repaint forces a full repaint.
 	repaint()
+
+	writeString(string) (int, error)
+
+	// resetLinesRendered ensures exec output remains on screen on exit
+	resetLinesRendered()
 }
 
 // repaintMsg forces a full repaint.
@@ -69,7 +90,7 @@ type printLineMessage struct {
 // its own line.
 //
 // If the altscreen is active no output will be printed.
-func Println(args ...interface{}) Cmd {
+func Println(args ...any) Cmd {
 	return func() Msg {
 		return printLineMessage{
 			messageBody: fmt.Sprint(args...),
@@ -85,7 +106,7 @@ func Println(args ...interface{}) Cmd {
 // its own line.
 //
 // If the altscreen is active no output will be printed.
-func Printf(template string, args ...interface{}) Cmd {
+func Printf(template string, args ...any) Cmd {
 	return func() Msg {
 		return printLineMessage{
 			messageBody: fmt.Sprintf(template, args...),
